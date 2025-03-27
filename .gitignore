@@ -1,0 +1,35 @@
+# Archivos de entorno
+.env
+
+# Logs
+*.log
+bitso_bot.log
+
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribución / empaquetado
+dist/
+build/
+*.egg-info/
+
+# Entornos virtuales
+venv/
+env/
+ENV/
+
+# Archivos de IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Base de datos local
+*.db
+*.sqlite3
+
+# Archivos temporales
+.DS_Store
+Thumbs.db
