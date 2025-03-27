@@ -293,7 +293,20 @@ class BitsoTradingBot:
                 return order
             return None
         except Exception as e:
-            logger.error(f"Error al verificar estado de orden: {e}")
+            error_str = str(e)
+            # Verificar si el error es código 0312 (orden ya cerrada/completada)
+            if "0312" in error_str:
+                logger.info(f"Orden {order_id} ya está cerrada o completada (código 0312)")
+                # Actualizar estado en la base de datos como completada
+                self.update_order_status(order_id, 'completed')
+                
+                # Eliminar de las listas de órdenes activas
+                if order_id in self.active_buy_orders:
+                    self.active_buy_orders.remove(order_id)
+                if order_id in self.active_sell_orders:
+                    self.active_sell_orders.remove(order_id)
+            else:
+                logger.error(f"Error al verificar estado de orden: {e}")
             return None
     
     def cancel_order(self, order_id):
