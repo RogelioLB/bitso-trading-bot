@@ -38,13 +38,14 @@ load_dotenv()
 # Configuración
 API_KEY = os.getenv("BITSO_API_KEY")
 API_SECRET = os.getenv("BITSO_API_SECRET")
-TARGET_PROFIT_PERCENTAGE = Decimal('0.0005')  # 0.05% de ganancia objetivo
-BOOK = "usdt_mxn"  # Libro a utilizar (USDT/Peso Mexicano)
+TARGET_PROFIT_PERCENTAGE = Decimal('0.015')  # 1.5% de ganancia objetivo (aumentado para BTC)
+BOOK = "btc_mxn"  # Libro a utilizar (BTC/Peso Mexicano)
 CHECK_INTERVAL = 60  # Intervalo de verificación en segundos
-TRADE_AMOUNT = Decimal('1')  # Cantidad de USDT a operar (ajustar según tus necesidades)
-SPREAD_FEE = Decimal('0.015')  # 1.5% de spread según Bitso
+TRADE_AMOUNT = Decimal('0.00001')  # Cantidad de BTC a operar (ajustado para BTC, aproximadamente 100-200 MXN)
+SPREAD_FEE = Decimal('0.01')  # 1% de spread según Bitso (valor por defecto si no se puede obtener de la API)
 MAX_ACTIVE_ORDERS = 5  # Número máximo de órdenes activas simultáneas
-MAX_PRICE_DIFF = Decimal('0.05')  # Diferencia máxima de precio para venta (0.05 MXN)
+BUY_DISCOUNT_PERCENTAGE = Decimal('0.015')  # 1.5% de descuento para órdenes de compra (aumentado para BTC)
+MAX_SELL_PRICE_FACTOR = Decimal('1.05')  # Factor máximo de precio de venta (5% sobre el precio de compra)
 
 # Configuración de la base de datos PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/bitso_bot")
@@ -93,7 +94,7 @@ class BitsoTradingBot:
         """Obtener el balance de la cuenta."""
         try:
             balances = self.api.balances()
-            logger.info(f"Balance USDT: {balances.usdt.available}")
+            logger.info(f"Balance BTC: {balances.btc.available}")
             logger.info(f"Balance MXN: {balances.mxn.available}")
             return balances
         except Exception as e:
@@ -104,7 +105,7 @@ class BitsoTradingBot:
         """Obtener las comisiones actuales."""
         try:
             fees = self.api.fees()
-            fee_percent = fees.usdt_mxn.fee_percent
+            fee_percent = fees.btc_mxn.fee_percent
             logger.info(f"Comisión actual: {fee_percent}%")
             return fee_percent / Decimal('100')  # Convertir a decimal (ej: 0.65% -> 0.0065)
         except Exception as e:
@@ -127,26 +128,54 @@ class BitsoTradingBot:
         Calcular precios de compra y venta para obtener la ganancia objetivo.
         
         La estrategia es:
-        1. Comprar a un precio ligeramente por debajo del ask actual
-        2. Vender a un precio realista que sea ligeramente superior al precio de compra
-           más un pequeño margen que cubra las comisiones
+        1. Comprar a un precio significativamente por debajo del bid actual (1.5% menos)
+        2. Vender a un precio que genere aproximadamente 1.5% de ganancia sobre el precio de compra
         """
         if not ticker:
             return None, None
         
-        # Precio de compra: ligeramente por debajo del ask para aumentar probabilidad de ejecución
-        buy_price = ticker.ask * Decimal('0.999')  # 0.1% por debajo del ask
+        # Precio de compra: significativamente por debajo del bid actual para esperar a que baje el precio
+        buy_price = ticker.bid * (Decimal('1') - BUY_DISCOUNT_PERCENTAGE)
+        buy_price = buy_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')  # Redondear a 2 decimales hacia abajo
         
-        # Cálculo del precio de venta con un margen realista
-        # En lugar de usar una fórmula que considere el spread completo, usamos un incremento fijo
-        # que sea alcanzable en el mercado real
-        sell_price = buy_price + MAX_PRICE_DIFF
+        # Calcular la comisión en BTC (usando el porcentaje de comisión de la API)
+        btc_fee = self.trade_amount * fee
         
-        logger.info(f"Precio de compra calculado: {buy_price}")
+        # Cantidad efectiva de BTC después de comisión
+        effective_btc = self.trade_amount - btc_fee
+        
+        # Precio mínimo para cubrir comisiones (punto de equilibrio)
+        breakeven_price = (buy_price * self.trade_amount) / effective_btc
+        
+        # Añadir margen de ganancia del 1.5%
+        sell_price = buy_price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
+        
+        # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
+        sell_price = max(sell_price, breakeven_price)
+        
+        # Establecer un límite máximo relativo al precio de compra
+        max_sell_price = buy_price * MAX_SELL_PRICE_FACTOR
+        sell_price = min(sell_price, max_sell_price)
+        
+        # Redondear el precio de venta a 2 decimales hacia arriba para asegurar la ganancia
+        sell_price = sell_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
+        
+        # Calcular la ganancia real estimada
+        estimated_profit = (sell_price * effective_btc) - (buy_price * self.trade_amount)
+        profit_percentage = ((sell_price / buy_price) - Decimal('1')) * Decimal('100')
+        
+        logger.info(f"Precio actual de mercado (bid): {ticker.bid}")
+        logger.info(f"Precio de compra calculado ({BUY_DISCOUNT_PERCENTAGE*100}% por debajo): {buy_price}")
+        logger.info(f"Precio de punto de equilibrio: {breakeven_price}")
         logger.info(f"Precio de venta calculado: {sell_price}")
+        logger.info(f"Margen de ganancia: {profit_percentage}%")
+        logger.info(f"Comisión porcentual de Bitso: {fee*100}%")
+        logger.info(f"Comisión estimada en BTC: {btc_fee}")
+        logger.info(f"BTC efectivo después de comisión: {effective_btc}")
+        logger.info(f"Ganancia estimada: {estimated_profit} MXN")
         
         return buy_price, sell_price
-    
+
     def save_order_to_db(self, order_id, side, price, amount, target_price=None, status='active'):
         """Guardar una orden en la base de datos."""
         try:
@@ -216,14 +245,48 @@ class BitsoTradingBot:
                 logger.warning(f"Saldo MXN insuficiente. Necesario: {required_mxn}, Disponible: {balances.mxn.available}")
                 return None
             
+            # Obtener comisión actual
+            fee = self.get_fees()
+            
             # Colocar orden de compra
             order = self.api.place_order(book=self.book, side='buy', order_type='limit', 
                                          major=str(self.trade_amount), price=str(price))
             
-            logger.info(f"Orden de compra colocada: {order['oid']} a {price} MXN por {self.trade_amount} USDT")
+            logger.info(f"Orden de compra colocada: {order['oid']} a {price} MXN por {self.trade_amount} BTC")
             
-            # Calcular precio objetivo de venta (precio de compra + margen fijo)
-            target_price = price + MAX_PRICE_DIFF
+            # Calcular la comisión en BTC
+            btc_fee = self.trade_amount * fee
+            
+            # Cantidad efectiva de BTC después de comisión
+            effective_btc = self.trade_amount - btc_fee
+            
+            # Precio mínimo para cubrir comisiones (punto de equilibrio)
+            breakeven_price = (price * self.trade_amount) / effective_btc
+            
+            # Añadir margen de ganancia del 1.5%
+            target_price = price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
+            
+            # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
+            target_price = max(target_price, breakeven_price)
+            
+            # Establecer un límite máximo relativo al precio de compra
+            max_target_price = price * MAX_SELL_PRICE_FACTOR
+            target_price = min(target_price, max_target_price)
+            
+            # Redondear el precio objetivo a 2 decimales hacia arriba para asegurar la ganancia
+            target_price = target_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
+            
+            # Calcular la ganancia real estimada
+            estimated_profit = (target_price * effective_btc) - (price * self.trade_amount)
+            profit_percentage = ((target_price / price) - Decimal('1')) * Decimal('100')
+            
+            logger.info(f"Comisión porcentual de Bitso: {fee*100}%")
+            logger.info(f"Comisión estimada en BTC: {btc_fee}")
+            logger.info(f"Precio de punto de equilibrio: {breakeven_price}")
+            logger.info(f"Precio objetivo de venta calculado: {target_price}")
+            logger.info(f"Margen de ganancia: {profit_percentage}%")
+            logger.info(f"BTC efectivo después de comisión: {effective_btc}")
+            logger.info(f"Ganancia estimada: {estimated_profit} MXN")
             
             # Guardar orden en la base de datos con el precio objetivo
             self.save_order_to_db(order['oid'], 'buy', price, self.trade_amount, target_price)
@@ -235,7 +298,7 @@ class BitsoTradingBot:
         except Exception as e:
             logger.error(f"Error al colocar orden de compra: {e}")
             return None
-    
+
     def place_sell_order(self, price, buy_price=None):
         """Colocar una orden de venta."""
         try:
@@ -245,18 +308,27 @@ class BitsoTradingBot:
                 logger.warning(f"Ya hay {active_sell_count} órdenes de venta activas. Límite: {MAX_ACTIVE_ORDERS}")
                 return None
             
-            # Verificar si tenemos suficiente saldo en USDT
+            # Verificar si tenemos suficiente saldo en BTC
             balances = self.api.balances()
             
-            if balances.usdt.available < self.trade_amount:
-                logger.warning(f"Saldo USDT insuficiente. Necesario: {self.trade_amount}, Disponible: {balances.usdt.available}")
+            # Obtener comisión actual
+            fee = self.get_fees()
+            
+            # Considerar que necesitamos tener suficiente BTC para cubrir la cantidad a vender más la comisión
+            btc_fee = self.trade_amount * fee
+            required_btc = self.trade_amount + btc_fee
+            
+            if balances.btc.available < required_btc:
+                logger.warning(f"Saldo BTC insuficiente. Necesario: {required_btc} (incluye comisión), Disponible: {balances.btc.available}")
                 return None
             
             # Colocar orden de venta
             order = self.api.place_order(book=self.book, side='sell', order_type='limit', 
                                          major=str(self.trade_amount), price=str(price))
             
-            logger.info(f"Orden de venta colocada: {order['oid']} a {price} MXN por {self.trade_amount} USDT")
+            logger.info(f"Orden de venta colocada: {order['oid']} a {price} MXN por {self.trade_amount} BTC")
+            logger.info(f"Comisión porcentual de Bitso: {fee*100}%")
+            logger.info(f"Comisión estimada en BTC: {btc_fee}")
             
             # Guardar orden en la base de datos
             self.save_order_to_db(order['oid'], 'sell', price, self.trade_amount, buy_price)
@@ -349,6 +421,9 @@ class BitsoTradingBot:
         if not ticker:
             return
         
+        # Obtener comisión actual
+        fee = self.get_fees()
+        
         for order in active_orders:
             # Verificar estado actual de la orden en Bitso
             bitso_order = self.check_order_status(order.order_id)
@@ -363,9 +438,60 @@ class BitsoTradingBot:
                 
                 # Usar el precio objetivo guardado en la base de datos
                 buy_price = Decimal(str(order.price))
-                sell_price = Decimal(str(order.target_price)) if order.target_price else buy_price + MAX_PRICE_DIFF
                 
-                # Colocar orden de venta
+                # IMPORTANTE: Usar exactamente el target_price guardado en la base de datos
+                # en lugar de recalcular un nuevo precio de venta
+                if order.target_price:
+                    sell_price = Decimal(str(order.target_price))
+                    # Verificar que el precio no sea mayor que el máximo permitido
+                    max_sell_price = buy_price * MAX_SELL_PRICE_FACTOR
+                    sell_price = min(sell_price, max_sell_price)
+                    logger.info(f"Usando precio objetivo de venta de la base de datos: {sell_price}")
+                else:
+                    # Si por alguna razón no hay target_price, calcular uno
+                    # Calcular la comisión en BTC
+                    btc_fee = self.trade_amount * fee
+                    
+                    # Cantidad efectiva de BTC después de comisión
+                    effective_btc = self.trade_amount - btc_fee
+                    
+                    # Precio mínimo para cubrir comisiones (punto de equilibrio)
+                    breakeven_price = (buy_price * self.trade_amount) / effective_btc
+                    
+                    # Añadir margen de ganancia del 1.5%
+                    sell_price = buy_price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
+                    
+                    # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
+                    sell_price = max(sell_price, breakeven_price)
+                    
+                    # Establecer un límite máximo relativo al precio de compra
+                    max_sell_price = buy_price * MAX_SELL_PRICE_FACTOR
+                    sell_price = min(sell_price, max_sell_price)
+                    
+                    # Redondear el precio de venta a 2 decimales hacia arriba
+                    sell_price = sell_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
+                    
+                    logger.info(f"No se encontró precio objetivo en la base de datos, calculando: {sell_price}")
+                
+                # Verificar que el precio de venta sea suficiente para cubrir comisiones y generar ganancia
+                btc_fee = self.trade_amount * fee
+                effective_btc = self.trade_amount - btc_fee
+                min_profitable_price = (buy_price * self.trade_amount) / effective_btc
+                
+                if sell_price < min_profitable_price:
+                    logger.warning(f"El precio objetivo {sell_price} es menor que el mínimo rentable {min_profitable_price}")
+                    sell_price = min_profitable_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
+                    logger.info(f"Ajustando precio de venta al mínimo rentable: {sell_price}")
+                
+                # Calcular la ganancia real estimada
+                estimated_profit = (sell_price * effective_btc) - (buy_price * self.trade_amount)
+                profit_percentage = ((sell_price / buy_price) - Decimal('1')) * Decimal('100')
+                logger.info(f"Comisión porcentual de Bitso: {fee*100}%")
+                logger.info(f"Comisión estimada en BTC: {btc_fee}")
+                logger.info(f"Margen de ganancia: {profit_percentage}%")
+                logger.info(f"Ganancia estimada: {estimated_profit} MXN")
+                
+                # Colocar orden de venta con el precio objetivo correcto
                 sell_order_id = self.place_sell_order(sell_price, buy_price)
                 
                 # Actualizar estado de la orden de compra
@@ -377,43 +503,47 @@ class BitsoTradingBot:
                 if ticker.bid >= Decimal(str(order.price)):
                     logger.info(f"Manteniendo orden de venta {order.order_id}, precio actual favorable")
                 # Si el precio ha bajado significativamente, considerar cancelar y recalcular
-                elif ticker.bid < Decimal(str(order.price)) * Decimal('0.99'):
+                elif ticker.bid < Decimal(str(order.price)) * Decimal('0.98'):  # Umbral más amplio para BTC
                     logger.info(f"Precio ha bajado significativamente para orden {order.order_id}, considerando recalcular")
                     # Aquí podrías implementar lógica para decidir si cancelar y recalcular
-    
+
     def run_trading_cycle(self):
-        """Ejecutar un ciclo completo de trading."""
+        """Ejecutar un ciclo de trading."""
         logger.info("Iniciando ciclo de trading...")
         
-        # Revisar órdenes activas primero
+        # Verificar órdenes activas
         self.check_active_orders()
         
-        # Obtener comisiones actuales
-        fee = self.get_fees()
-        
-        # Obtener información del mercado
+        # Obtener ticker actual
         ticker = self.get_ticker()
+        if not ticker:
+            return
+        
+        # Obtener comisión actual
+        fee = self.get_fees()
         
         # Calcular precios de compra y venta
         buy_price, sell_price = self.calculate_prices(ticker, fee)
-        
         if not buy_price or not sell_price:
-            logger.error("No se pudieron calcular los precios. Saltando ciclo.")
             return
         
-        # Verificar si hay suficiente saldo para operar
+        # Obtener balance actual
         balances = self.get_account_balance()
         if not balances:
             return
         
         # Colocar nuevas órdenes según el saldo disponible y el límite de órdenes activas
         
-        # Si tenemos USDT disponible, colocar orden(es) de venta
-        if balances.usdt.available >= self.trade_amount:
+        # Si tenemos BTC disponible, colocar orden(es) de venta
+        btc_fee = self.trade_amount * fee
+        required_btc = self.trade_amount + btc_fee
+        if balances.btc.available >= required_btc:
             active_sell_count = self.count_active_orders_by_side('sell')
             if active_sell_count < MAX_ACTIVE_ORDERS:
-                logger.info(f"Tenemos USDT disponible ({balances.usdt.available}), colocando orden de venta")
+                logger.info(f"Tenemos BTC disponible ({balances.btc.available}), colocando orden de venta")
                 self.place_sell_order(sell_price)
+        else:
+            logger.info(f"BTC insuficiente para venta. Disponible: {balances.btc.available}, Necesario: {required_btc} (incluye comisión)")
         
         # Si tenemos MXN disponible, colocar orden(es) de compra
         if balances.mxn.available >= buy_price * self.trade_amount:
@@ -421,7 +551,9 @@ class BitsoTradingBot:
             if active_buy_count < MAX_ACTIVE_ORDERS:
                 logger.info(f"Tenemos MXN disponible ({balances.mxn.available}), colocando orden de compra")
                 self.place_buy_order(buy_price)
-    
+        else:
+            logger.info(f"MXN insuficiente para compra. Disponible: {balances.mxn.available}, Necesario: {buy_price * self.trade_amount}")
+
     def run(self):
         """Ejecutar el bot de trading continuamente."""
         logger.info("Iniciando bot de trading de Bitso...")
