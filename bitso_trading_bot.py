@@ -38,14 +38,12 @@ load_dotenv()
 # Configuración
 API_KEY = os.getenv("BITSO_API_KEY")
 API_SECRET = os.getenv("BITSO_API_SECRET")
-TARGET_PROFIT_PERCENTAGE = Decimal('0.015')  # 1.5% de ganancia objetivo (aumentado para BTC)
+TARGET_PROFIT_PERCENTAGE = Decimal('0.02')  # 2% de ganancia objetivo
 BOOK = "btc_mxn"  # Libro a utilizar (BTC/Peso Mexicano)
 CHECK_INTERVAL = 60  # Intervalo de verificación en segundos
 TRADE_AMOUNT = Decimal('0.00001')  # Cantidad de BTC a operar (ajustado para BTC, aproximadamente 100-200 MXN)
 SPREAD_FEE = Decimal('0.01')  # 1% de spread según Bitso (valor por defecto si no se puede obtener de la API)
-MAX_ACTIVE_ORDERS = 5  # Número máximo de órdenes activas simultáneas
-BUY_DISCOUNT_PERCENTAGE = Decimal('0.015')  # 1.5% de descuento para órdenes de compra (aumentado para BTC)
-MAX_SELL_PRICE_FACTOR = Decimal('1.05')  # Factor máximo de precio de venta (5% sobre el precio de compra)
+MAX_SELL_PRICE_FACTOR = Decimal('1.10')  # Factor máximo de precio de venta (10% sobre el precio de compra)
 
 # Configuración de la base de datos PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/bitso_bot")
@@ -128,14 +126,14 @@ class BitsoTradingBot:
         Calcular precios de compra y venta para obtener la ganancia objetivo.
         
         La estrategia es:
-        1. Comprar a un precio significativamente por debajo del bid actual (1.5% menos)
-        2. Vender a un precio que genere aproximadamente 1.5% de ganancia sobre el precio de compra
+        1. Comprar al precio de mercado actual (bid)
+        2. Vender a un precio que genere aproximadamente 2% de ganancia sobre el precio de compra
         """
         if not ticker:
             return None, None
         
-        # Precio de compra: significativamente por debajo del bid actual para esperar a que baje el precio
-        buy_price = ticker.bid * (Decimal('1') - BUY_DISCOUNT_PERCENTAGE)
+        # Precio de compra: precio de mercado actual
+        buy_price = ticker.bid
         buy_price = buy_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')  # Redondear a 2 decimales hacia abajo
         
         # Calcular la comisión en BTC (usando el porcentaje de comisión de la API)
@@ -147,7 +145,7 @@ class BitsoTradingBot:
         # Precio mínimo para cubrir comisiones (punto de equilibrio)
         breakeven_price = (buy_price * self.trade_amount) / effective_btc
         
-        # Añadir margen de ganancia del 1.5%
+        # Añadir margen de ganancia del 2%
         sell_price = buy_price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
         
         # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
@@ -165,7 +163,7 @@ class BitsoTradingBot:
         profit_percentage = ((sell_price / buy_price) - Decimal('1')) * Decimal('100')
         
         logger.info(f"Precio actual de mercado (bid): {ticker.bid}")
-        logger.info(f"Precio de compra calculado ({BUY_DISCOUNT_PERCENTAGE*100}% por debajo): {buy_price}")
+        logger.info(f"Precio de compra: {buy_price}")
         logger.info(f"Precio de punto de equilibrio: {breakeven_price}")
         logger.info(f"Precio de venta calculado: {sell_price}")
         logger.info(f"Margen de ganancia: {profit_percentage}%")
@@ -231,12 +229,6 @@ class BitsoTradingBot:
     def place_buy_order(self, price):
         """Colocar una orden de compra."""
         try:
-            # Verificar si ya tenemos demasiadas órdenes de compra activas
-            active_buy_count = self.count_active_orders_by_side('buy')
-            if active_buy_count >= MAX_ACTIVE_ORDERS:
-                logger.warning(f"Ya hay {active_buy_count} órdenes de compra activas. Límite: {MAX_ACTIVE_ORDERS}")
-                return None
-            
             # Verificar si tenemos suficiente saldo en MXN
             balances = self.api.balances()
             required_mxn = price * self.trade_amount
@@ -263,7 +255,7 @@ class BitsoTradingBot:
             # Precio mínimo para cubrir comisiones (punto de equilibrio)
             breakeven_price = (price * self.trade_amount) / effective_btc
             
-            # Añadir margen de ganancia del 1.5%
+            # Añadir margen de ganancia del 2%
             target_price = price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
             
             # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
@@ -302,12 +294,6 @@ class BitsoTradingBot:
     def place_sell_order(self, price, buy_price=None):
         """Colocar una orden de venta."""
         try:
-            # Verificar si ya tenemos demasiadas órdenes de venta activas
-            active_sell_count = self.count_active_orders_by_side('sell')
-            if active_sell_count >= MAX_ACTIVE_ORDERS:
-                logger.warning(f"Ya hay {active_sell_count} órdenes de venta activas. Límite: {MAX_ACTIVE_ORDERS}")
-                return None
-            
             # Verificar si tenemos suficiente saldo en BTC
             balances = self.api.balances()
             
@@ -458,7 +444,7 @@ class BitsoTradingBot:
                     # Precio mínimo para cubrir comisiones (punto de equilibrio)
                     breakeven_price = (buy_price * self.trade_amount) / effective_btc
                     
-                    # Añadir margen de ganancia del 1.5%
+                    # Añadir margen de ganancia del 2%
                     sell_price = buy_price * (Decimal('1') + TARGET_PROFIT_PERCENTAGE)
                     
                     # Asegurarnos de que el precio de venta sea al menos el mínimo necesario para no perder
@@ -532,25 +518,21 @@ class BitsoTradingBot:
         if not balances:
             return
         
-        # Colocar nuevas órdenes según el saldo disponible y el límite de órdenes activas
+        # Colocar nuevas órdenes según el saldo disponible
         
         # Si tenemos BTC disponible, colocar orden(es) de venta
         btc_fee = self.trade_amount * fee
         required_btc = self.trade_amount + btc_fee
         if balances.btc.available >= required_btc:
-            active_sell_count = self.count_active_orders_by_side('sell')
-            if active_sell_count < MAX_ACTIVE_ORDERS:
-                logger.info(f"Tenemos BTC disponible ({balances.btc.available}), colocando orden de venta")
-                self.place_sell_order(sell_price)
+            logger.info(f"Tenemos BTC disponible ({balances.btc.available}), colocando orden de venta")
+            self.place_sell_order(sell_price)
         else:
             logger.info(f"BTC insuficiente para venta. Disponible: {balances.btc.available}, Necesario: {required_btc} (incluye comisión)")
         
         # Si tenemos MXN disponible, colocar orden(es) de compra
         if balances.mxn.available >= buy_price * self.trade_amount:
-            active_buy_count = self.count_active_orders_by_side('buy')
-            if active_buy_count < MAX_ACTIVE_ORDERS:
-                logger.info(f"Tenemos MXN disponible ({balances.mxn.available}), colocando orden de compra")
-                self.place_buy_order(buy_price)
+            logger.info(f"Tenemos MXN disponible ({balances.mxn.available}), colocando orden de compra")
+            self.place_buy_order(buy_price)
         else:
             logger.info(f"MXN insuficiente para compra. Disponible: {balances.mxn.available}, Necesario: {buy_price * self.trade_amount}")
 
